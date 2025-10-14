@@ -1,0 +1,31 @@
+# Ignore experimental and test directories/files
+examples_sc/
+examples_previous/
+experiment/
+experiment_sc/
+test.py
+
+# Optional analysis scripts (not for release)
+merge_rttm.py
+purity_and_coverage.py
+
+# Python cache and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# Logs / checkpoints / outputs
+logs/
+runs/
+outputs/
+*.log
+*.tar
+*.tar.gz
+*.ckpt
+*.pt
+*.pth
+*.npy
+*.npz

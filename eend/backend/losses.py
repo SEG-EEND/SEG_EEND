@@ -13,41 +13,94 @@ from typing import List, Tuple
 from torch.nn.functional import logsigmoid
 from scipy.optimize import linear_sum_assignment
 
+# ---- global cache for permutation indices ----
+_PERM_CACHE = {}  # k(int) -> LongTensor [P_k, k]
+
+def _get_perm_idx(k: int, device: torch.device) -> torch.Tensor:
+    # Return cached permutations for k speakers
+    if k not in _PERM_CACHE:
+        from itertools import permutations
+        perms = list(permutations(range(k)))       # length = k!
+        _PERM_CACHE[k] = torch.tensor(perms, dtype=torch.long)
+    return _PERM_CACHE[k].to(device, non_blocking=True)
+
 
 def pit_loss_multispk(
-        logits: List[torch.Tensor], target: List[torch.Tensor],
-        n_speakers: np.ndarray, detach_attractor_loss: bool):
+        logits: torch.Tensor,               # [B,T,S]
+        target: torch.Tensor,               # [B,T,S], -1 = padded
+        n_speakers: np.ndarray,             # [B]
+        detach_attractor_loss: bool):
+    """
+    Faster PIT:
+    - Split batch by unique k = n_speakers
+    - For each group, run PIT on only k speakers (k! perms)
+    - All on GPU, no CPU/NumPy/Scipy
+    """
+    device = logits.device
+    B, T, S = logits.shape
+
+    # Make tensors for masks ops
+    nspk = torch.as_tensor(n_speakers, device=device, dtype=torch.long)
+
+    # Optional: mask speakers after k with -1 (kept for behavior parity)
     if detach_attractor_loss:
-        # -1's for speakers that do not have valid attractor
-        for i in range(target.shape[0]):
-            target[i, :, n_speakers[i]:] = -1 * torch.ones(
-                          target.shape[1], target.shape[2]-n_speakers[i])
+        spk_idx = torch.arange(S, device=device).view(1, 1, S).expand(B, 1, S)
+        valid_spk_mask = spk_idx < nspk.view(B, 1, 1)
+        target = target.clone()
+        target[:, :, ~valid_spk_mask.squeeze(1)] = -1.0
 
-    logits_t = logits.detach().transpose(1, 2)
-    cost_mxs = -logsigmoid(logits_t).bmm(target) - logsigmoid(-logits_t).bmm(1-target)
+    # Collect losses from each k-group
+    all_min_losses = []
 
-    max_n_speakers = max(n_speakers)
+    # Unique k values in this batch
+    ks = torch.unique(nspk).tolist()
+    for k in ks:
+        if k <= 0:
+            continue  # skip empty
+        # Select samples with this k
+        idx = (nspk == k)
+        if not torch.any(idx):
+            continue
 
-    for i, cost_mx in enumerate(cost_mxs.cpu().numpy()):
-        if max_n_speakers > n_speakers[i]:
-            max_value = np.absolute(cost_mx).sum()
-            cost_mx[-(max_n_speakers-n_speakers[i]):] = max_value
-            cost_mx[:, -(max_n_speakers-n_speakers[i]):] = max_value
-        pred_alig, ref_alig = linear_sum_assignment(cost_mx)
-        assert (np.all(pred_alig == np.arange(logits.shape[-1])))
-        target[i, :] = target[i, :, ref_alig]
-    loss = torch.nn.functional.binary_cross_entropy_with_logits(
-             logits, target, reduction='none')
+        # Slice to first k speakers only (both logits and target)
+        # Size: [B_k, T, k]
+        log_k = logits[idx][:, :, :k]
+        tar_k = target[idx][:, :, :k]
 
-    loss[torch.where(target == -1)] = 0
-    # normalize by sequence length
-    loss = torch.sum(loss, axis=1) / (target != -1).sum(axis=1)
-    for i in range(target.shape[0]):
-        loss[i, n_speakers[i]:] = torch.zeros(loss.shape[1]-n_speakers[i])
+        # Build permutations for k
+        perm_idx = _get_perm_idx(k, device)             # [P,k]
+        P = perm_idx.shape[0]
 
-    # normalize in batch for all speakers
-    loss = torch.mean(loss)
-    return loss
+        # Reorder target by perms: [P,B_k,T,k]
+        tar_exp = tar_k.unsqueeze(0).expand(P, -1, -1, -1)
+        idx_exp = perm_idx.view(P, 1, 1, k).expand(-1, tar_k.size(0), T, -1)
+        t_perm = torch.gather(tar_exp, 3, idx_exp)
+
+        # Valid mask for BCE: True where target >= 0
+        valid = (t_perm >= 0.0)                          # [P,B_k,T,k]
+
+        # BCE with logits per perm, no reduction
+        # Logits expand to [P,B_k,T,k]
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            log_k.unsqueeze(0).expand(P, -1, -1, -1),
+            torch.clamp(t_perm, 0.0, 1.0),
+            reduction='none'
+        )
+
+        # Mask out invalid positions
+        bce = bce * valid
+
+        # Reduce over time and speakers
+        num   = bce.sum((2, 3))                          # [P,B_k]
+        denom = valid.sum((2, 3)).clamp_min(1)           # [P,B_k]
+        loss_perm = num / denom                          # [P,B_k]
+
+        # Min over permutations
+        min_loss, _ = loss_perm.min(dim=0)               # [B_k]
+        all_min_losses.append(min_loss)
+
+    # Mean over all samples
+    return torch.cat(all_min_losses, dim=0).mean()
 
 
 def vad_loss(ys: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:

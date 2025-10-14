@@ -19,7 +19,7 @@ def get_labeledSTFT(
     frame_shift: int,
     n_speakers: int = None,
     use_speaker_id: bool = False
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]: #def dummy():
     """
     Extracts STFT and corresponding diarization labels for
     given recording id and start/end times
@@ -79,7 +79,7 @@ def get_labeledSTFT(
         return Y, T
 
 
-def splice(Y: np.ndarray, context_size: int = 0) -> np.ndarray:
+def splice(Y: np.ndarray, context_size: int = 0) -> np.ndarray: #def dummy():
     """ Frame splicing
     Args:
         Y: feature
@@ -105,8 +105,8 @@ def splice(Y: np.ndarray, context_size: int = 0) -> np.ndarray:
 def stft(
     data: np.ndarray,
     frame_size: int,
-    frame_shift: int
-) -> np.ndarray:
+    frame_shift: int 
+) -> np.ndarray: #def dummy():
     """ Compute STFT features
     Args:
         data: audio signal
@@ -133,7 +133,7 @@ def subsample(
     Y: np.ndarray,
     T: np.ndarray,
     subsampling: int = 1
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]: #def dummy():
     """ Frame subsampling
     """
     Y_ss = Y[::subsampling]
@@ -147,7 +147,7 @@ def transform(
     feature_dim: int,
     transform_type: str,
     dtype: type = np.float32,
-) -> np.ndarray:
+) -> np.ndarray: #def dummy():
     """ Transform STFT feature
     Args:
         Y: STFT
@@ -162,7 +162,7 @@ def transform(
     Y = np.abs(Y)
     if transform_type.startswith('logmel'):
         n_fft = 2 * (Y.shape[1] - 1)
-        mel_basis = librosa.filters.mel(sampling_rate, n_fft, feature_dim)
+        mel_basis = librosa.filters.mel(sr=sampling_rate, n_fft=n_fft, n_mels=feature_dim,dtype=np.float32)
         Y = np.dot(Y ** 2, mel_basis.T)
         Y = np.log10(np.maximum(Y, 1e-10))
         if transform_type == 'logmel_meannorm':

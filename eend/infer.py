@@ -129,7 +129,7 @@ def postprocess_output(
     threshold: float,
     median_window_length: int
 ) -> np.ndarray:
-    thresholded = probabilities > threshold
+    thresholded = (probabilities > threshold).float()
     # Use this instead if it fails with newer medfilt version
     # (see https://github.com/scipy/scipy/issues/16648)
     # thresholded = 1.0 * (probabilities > threshold)

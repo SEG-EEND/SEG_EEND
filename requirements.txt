@@ -1,9 +1,19 @@
-librosa==0.8.0
-logging==0.5.1.2
-numpy==1.19.5
-safe_gpu
-scipy==1.5.3
-soundfile==0.10.3.post1
-tensorboard
-torch==1.10.0
-yamlargparse==1.31.1
+# Core
+torch==2.3.1
+torchvision==0.18.1
+torchaudio==2.3.1
+
+# Scientific stack
+numpy>=1.23,<2.1
+scipy>=1.11,<1.14
+librosa>=0.10.1
+soundfile>=0.12.1
+
+# Logging / utils
+tensorboard>=2.14
+yamlargparse>=1.31.1
+safe-gpu>=2.0.0
+
+# Pyannote
+pyannote.metrics>=3.2
+pyannote.core>=5.0

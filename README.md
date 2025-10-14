@@ -1,50 +1,95 @@
-# End-to-end Neural Diarization
+# SEG-EEND: SEGMENT-LEVEL END-TO-END NEURAL DIARIZATION WITH SPEAKER STATE CHANGE DETECTION
 
-PyTorch implementation for End-to-End Neural Diarization (EEND) based on Chainer implementation by [Hitachi](https://github.com/hitachi-speech/EEND). This code implements the encoder-decoder-based attractor with self-attention version of EEND.
+This repository extends the PyTorch implementation of End-to-End Neural Diarization (EEND) originally developed by [BUT Speech@FIT](https://github.com/BUTSpeechFIT/EEND).  
+**SEG_EEND** introduces a *segment-level* approach that incorporates a **Speaker State Change Detector (SSCD)** to enhance diarization accuracy, especially under multi-speaker and overlapping speech conditions.
 
+---
 
+## 🔍 Overview
 
-## Usage
-To run the training you can call:
+SEG_EEND integrates a **Speaker State Change Detector** into the standard EEND framework, enabling the model to explicitly learn transitions in speaker activity.  
+This helps improve temporal consistency and boundary detection, leading to better DER and speaker change localization.
 
-    python eend/train.py -c examples/train.yaml
-Note that in the example you need to define the train and validation data directories as well as the output directory. The rest of the parameters are standard ones, as used in our publication.
-For fine-tuning, the process is similar:
+---
 
-    python eend/train.py -c examples/adapt.yaml
-In that case, you will need to provide the path where to find the trained model(s) that you want to fine-tune.
+## 🧩 Directory Structure
 
-To run the inference, you can call:
-
-    python eend/infer.py -c examples/infer.yaml
-Note that in the example you need to define the data, model and output directories.
-
-## Citation
-In case of using the software please cite:\
-Federico Landini, Alicia Lozano-Diez, Mireia Diez, Lukáš Burget: [From Simulated Mixtures to Simulated Conversations as Training Data for End-to-End Neural Diarization](https://arxiv.org/abs/2204.00890)
 ```
-@inproceedings{landini22_interspeech,
-  author={Federico Landini and Alicia Lozano-Diez and Mireia Diez and Lukáš Burget},
-  title={{From Simulated Mixtures to Simulated Conversations as Training Data for End-to-End Neural Diarization}},
-  year=2022,
-  booktitle={Proc. Interspeech 2022},
-  pages={5095--5099},
-  doi={10.21437/Interspeech.2022-10451}
-}
+SEG_EEND/
+├─ eend/ # Core source code (model, trainer, data loader)
+├─ examples/ # Example configuration files for training/inference
+├─ .gitignore
+├─ README.md
+├─ requirements.txt
+
 ```
 
-Federico Landini, Mireia Diez, Alicia Lozano-Diez, Lukáš Burget: [Multi-Speaker and Wide-Band Simulated Conversations as Training Data for End-to-End Neural Diarization](https://arxiv.org/abs/2211.06750)
-```
-@inproceedings{landini2023multi,
-  title={Multi-Speaker and Wide-Band Simulated Conversations as Training Data for End-to-End Neural Diarization},
-  author={Landini, Federico and Diez, Mireia and Lozano-Diez, Alicia and Burget, Luk{\'a}{\v{s}}},
-  booktitle={ICASSP 2023-2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
-  pages={1--5},
-  year={2023},
-  organization={IEEE}
-}
+## ⚙️ Installation
+
+```bash
+git clone https://github.com/SEG-EEND/SEG_EEND.git
+cd SEG_EEND
+conda create -n seg_eend python=3.10
+conda activate seg_eend
+pip install -r requirements.txt
 ```
 
+## 🚀 Training
+To start distributed multi-GPU training:
 
-## Contact
-If you have any comment or question, please contact landini@fit.vutbr.cz
+```bash
+CUDA_VISIBLE_DEVICES=<GPU_IDs> torchrun --nproc_per_node=<NUM_GPUs> \
+    eend/train.py -c <path_to_config.yaml> --ddp
+```
+
+Example:
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 \
+    eend/train.py -c examples/train_scd.yaml --ddp --noam-k 1
+```
+
+**Notes**
+- `--ddp` enables DistributedDataParallel training.  
+- `--noam-k` sets the learning rate scale factor.  
+  (The `--noam-k` option was added to prevent learning rate scaling with the number of GPUs.  
+  Setting it to 1 disables the default behavior where the learning rate is divided by the number of GPUs.)  
+- Modify paths for training/validation data and `save_dir` inside the YAML config before training.  
+- All GPUs listed in `CUDA_VISIBLE_DEVICES` will be used automatically.
+
+## 🔁 Fine-tuning
+To fine-tune from a pre-trained model, specify the checkpoint path either in the config file or via command-line argument:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 \
+    eend/train.py -c examples/adapt_scd.yaml --ddp --noam-k 1
+```
+
+## 🎧 Inference
+To perform diarization inference:
+
+```bash
+python eend/infer.py -c examples/infer_scd.yaml
+```
+
+Define the input audio directory, model checkpoint, and output directory in the configuration file.
+
+## 🧮 Evaluation
+For evaluation metrics such as DER, JER, and speaker change detection (SCD):  
+In this code, DER is a simplified metric. For more accurate measurement, it is recommended to use the official [dscore](https://github.com/nryant/dscore) tool.
+
+## 📚 References
+
+[1] C. Moon, M. H. Han, J. Park, N. S. Kim,
+“SEG-EEND: SEGMENT-LEVEL END-TO-END NEURAL DIARIZATION WITH SPEAKER STATE CHANGE DETECTION,”
+submitted to ICASSP 2026.
+
+[2] S. Horiguchi, Y. Fujita, S. Watanabe, Y. Xue, and P. García,
+“Encoder-decoder based attractors for end-to-end neural diarization,”
+IEEE/ACM Transactions on Audio, Speech, and Language Processing, vol. 30, pp. 1493–1507, 2022.
+
+[3] Original EEND repository (BUT Speech@FIT):
+https://github.com/BUTSpeechFIT/EEND
+
+
+## License
+This repository is released under the MIT License.
