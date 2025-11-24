@@ -1,8 +1,10 @@
 # Ignore experimental and test directories/files
 examples_sc/
 examples_previous/
+examples/
 experiment/
 experiment_sc/
+plot/
 test.py
 
 # Optional analysis scripts (not for release)
@@ -16,6 +18,7 @@ __pycache__/
 *.pyd
 *.egg-info/
 .eggs/
+*.ipynb
 
 # Logs / checkpoints / outputs
 logs/
