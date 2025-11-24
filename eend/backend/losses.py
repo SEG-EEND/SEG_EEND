@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 
 # Copyright 2019 Hitachi, Ltd. (author: Yusuke Fujita)
-# Copyright 2022 Brno University of Technology (authors: Federico Landini, Lukas Burget, Mireia Diez)
-# Copyright 2022 AUDIAS Universidad Autonoma de Madrid (author: Alicia Lozano-Diez)
+# Copyright 2025 Human Interface Lab (author: C. Moon)
 # Licensed under the MIT license.
 
 from itertools import permutations
@@ -102,6 +101,87 @@ def pit_loss_multispk(
     # Mean over all samples
     return torch.cat(all_min_losses, dim=0).mean()
 
+def sort_loss_multispk(
+    logits: torch.Tensor,               # [B, T, S] raw logits
+    target: torch.Tensor,               # [B, T, S], -1 means padded speaker
+    n_speakers: np.ndarray,             # [B] number of active speakers per item
+    detach_attractor_loss: bool,        # kept for API parity (not used here)
+):
+    """
+    Sort-based diarization loss (no PIT):
+    - For each sample, sort speaker rows by first active frame (earliest first).
+    - Compare model logits to the sorted targets with BCEWithLogits.
+    - Mask out padded speakers (-1) and padded frames.
+    - Group by k = number of speakers to avoid useless work.
+    """
+
+    device = logits.device
+    B, T, S = logits.shape
+    nspk = torch.as_tensor(n_speakers, device=device, dtype=torch.long)
+
+    # Collect losses from each k-group
+    sample_losses = []
+
+    # Unique k values in this batch
+    for k in torch.unique(nspk).tolist():
+        if k <= 0:
+            continue
+        idx = (nspk == k)
+        if not torch.any(idx):
+            continue
+
+        # Slice to first k speakers (common EEND practice)
+        log_k = logits[idx][:, :, :k]   # [B_k, T, k]
+        tar_k = target[idx][:, :, :k]   # [B_k, T, k]
+        Bk = log_k.size(0)
+
+        # Per-sample sort and BCE
+        for b in range(Bk):
+            y = tar_k[b]                  # [T, k]
+            p = log_k[b]                  # [T, k]
+
+            # Frame-valid mask: true where at least one speaker is not padded
+            # (all -1 -> padded frame)
+            valid_t = (y >= 0.0).any(dim=1)    # [T]
+
+            # Build an "effective" target to find onsets (ignore padded frames)
+            y_eff = y.clone()
+            y_eff[~valid_t] = 0.0
+
+            # Find first-onset per speaker (first frame with y>0.5)
+            onsets = []
+            for s_idx in range(k):
+                nz = (y_eff[:, s_idx] > 0.5).nonzero(as_tuple=False)
+                if nz.numel() == 0:
+                    onsets.append(T + 10_000_000)  # very large if never active
+                else:
+                    onsets.append(int(nz[0, 0].item()))
+
+            # Sort speakers by earliest onset
+            order = torch.tensor(onsets, device=device).argsort()  # [k]
+            y_sorted = y[:, order]  # [T, k]
+
+            # Valid mask for BCE: keep only non-padded speaker entries and valid frames
+            valid_spk = (y_sorted >= 0.0)                 # [T, k]
+            valid = valid_spk & valid_t.unsqueeze(1)      # [T, k]
+
+            if not valid.any():
+                # nothing valid to compute
+                continue
+
+            # BCEWithLogits over valid positions only
+            loss_mat = torch.nn.functional.binary_cross_entropy_with_logits(
+                p[valid],                              # logits at valid positions
+                torch.clamp(y_sorted[valid], 0.0, 1.0),# targets in {0,1}
+                reduction='sum'
+            )
+            denom = valid.sum().clamp_min(1).float()
+            sample_losses.append(loss_mat / denom)
+
+    if len(sample_losses) == 0:
+        return torch.tensor(0.0, device=device)
+
+    return torch.stack(sample_losses).mean()
 
 def vad_loss(ys: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:
     # Take from reference ts only the speakers that do not correspond to -1

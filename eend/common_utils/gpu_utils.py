@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 # Copyright 2022 Brno University of Technology (author: Federico Landini)
+# Copyright 2025 Human Interface Lab (author: C. Moon)
 # Licensed under the MIT license.
 
 from safe_gpu import safe_gpu

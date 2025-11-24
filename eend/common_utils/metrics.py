@@ -107,8 +107,8 @@ def new_metrics() -> Dict[str, float]: #def dummy():
     metrics = {}
     for k in [
         'loss',
-        'loss_standard',  # 추가
-        'loss_attractor',  # 추가
+        'loss_standard',  # add
+        'loss_attractor',  # add
         'activation_loss_BCE',
         'l2a_entropy_term',
         'activation_loss_DER',
@@ -152,10 +152,10 @@ def new_metrics_scd() -> Dict[str, float]: #def dummy():
     metrics = {}
     for k in [
         'loss',
-        'loss_standard',  # 추가
-        'loss_attractor',  # 추가
-        'loss_scd', #추가
-        'loss_seg_PIT', #추가
+        'loss_standard',  # add
+        'loss_attractor',  # add
+        'loss_scd', #add
+        'loss_seg_PIT', #add
         'activation_loss_BCE',
         'l2a_entropy_term',
         'activation_loss_DER',

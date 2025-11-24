@@ -2,6 +2,7 @@
 
 # Copyright 2019 Hitachi, Ltd. (author: Yusuke Fujita)
 # Copyright 2022 Brno University of Technology (author: Federico Landini)
+# Copyright 2025 Human Interface Lab (author: C. Moon)
 # Licensed under the MIT license.
 
 from backend.models import (
@@ -184,6 +185,13 @@ def parse_arguments() -> SimpleNamespace:
     parser.add_argument('--transformer-encoder-dropout', type=float)
     parser.add_argument('--vad-loss-weight', default=0.0, type=float)
 
+    parser.add_argument('--use-posenc', action='store_true',
+                        help='Enable positional encoding (must match training).')
+    parser.add_argument('--hybrid-loss', action='store_true',
+                        help='Enable hybrid loss flag (kept for model parity).')
+    parser.add_argument('--hybrid-sort-weight', type=float, default=0.5,
+                        help='Sort loss weight used during training (for parity/logging).')
+
     attractor_args = parser.add_argument_group('attractor')
     attractor_args.add_argument(
         '--time-shuffle', action='store_true',
@@ -204,7 +212,7 @@ def parse_arguments() -> SimpleNamespace:
     return args
 
 
-if __name__ == '__main__':
+if __name__ == '__main__': 
     args = parse_arguments()
 
     # For reproducibility

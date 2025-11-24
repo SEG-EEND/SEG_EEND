@@ -2,12 +2,14 @@
 
 # Copyright 2019 Hitachi, Ltd. (author: Yusuke Fujita)
 # Copyright 2022 Brno University of Technology (author: Federico Landini)
+# Copyright 2025 Human Interface Lab (author: C. Moon)
 # Licensed under the MIT license.
 
 from os.path import isfile, join
 
 from backend.losses import (
     pit_loss_multispk,
+    sort_loss_multispk,
     vad_loss,
 )
 from backend.updater import (
@@ -25,6 +27,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 import logging
 import os
+import math
+## for using conformer ...
+from torchaudio.models import Conformer
 
 """
 T: number of frames
@@ -32,16 +37,16 @@ C: number of speakers (classes)
 D: dimension of embedding (for deep clustering loss)
 B: mini-batch size
 """
-
+        
 class StateChangeDetector(Module):
     def __init__(self, n_units: int, dropout: float = 0.1, device: torch.device = torch.device("cpu")):
         """
-        CNN 기반 State Change Detector
+        CNN-based State Change Detector
 
         Args:
-            n_units (int): 입력 임베딩 차원
-            dropout (float): 드롭아웃 비율
-            device (torch.device): 실행할 디바이스 (기본값: "cpu")
+            n_units (int): input emb dim
+            dropout (float): drop out percentage
+            device (torch.device): device
         """
         super(StateChangeDetector, self).__init__()
         self.device = device
@@ -53,7 +58,7 @@ class StateChangeDetector(Module):
         self.to(device)
 
     def forward(self, xs: torch.Tensor) -> torch.Tensor: #def dummy():
-        """ State Change Probability 계산 """
+        """ Calculate State Change Probability """
         # print("already padded")
         # print("xs.shape: ", xs.shape)
         xs_transposed = xs.permute(0, 2, 1)  # (B, T, D) → (B, D, T)
@@ -64,7 +69,7 @@ class StateChangeDetector(Module):
         # print("h.shape: ", h.shape)
         h = h.permute(0, 2, 1)  # (B, D/2, T) → (B, T, D/2)
         
-        # ✅ `view()` 대신 `.reshape()` 사용하여 메모리 연속성 문제 해결
+        # Using reshape
         h = torch.tanh(self.detector_layer_2(h.reshape(-1, h.shape[-1])))
         # print("after second layer")
         # print("h.shape: ", h.shape)
@@ -76,8 +81,28 @@ class StateChangeDetector(Module):
         # print("after view")
         # print("h.shape: ", h.shape)
         
-        return h.squeeze(dim=-1)  # ✅ (B, T) 형태로 반환
+        return h.squeeze(dim=-1)  # (B, T) 
 
+class SinusoidalPositionalEncoding(torch.nn.Module):
+    """
+    Add a fixed sinusoidal position signal to time axis.
+    x: (B, T, D) -> (B, T, D)
+    """
+    def __init__(self, d_model: int, dropout: float = 0.0, max_len: int = 20000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)  # (max_len, D)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        T = x.size(1)
+        x = x + self.pe[:T].unsqueeze(0)
+        return x
+    
 class EncoderDecoderAttractor(Module):
     def __init__(
         self,
@@ -247,7 +272,8 @@ class TransformerEncoder(Module):
         n_units: int,
         e_units: int,
         h: int,
-        dropout: float
+        dropout: float,
+        use_posenc: bool = False,
     ) -> None:
         super(TransformerEncoder, self).__init__()
         self.device = device
@@ -255,6 +281,11 @@ class TransformerEncoder(Module):
         self.lnorm_in = torch.nn.LayerNorm(n_units, device=self.device)
         self.n_layers = n_layers
         self.dropout = dropout
+        
+        # for sort loss: positional encoding
+        self.use_posenc = use_posenc
+        self.pos_enc = SinusoidalPositionalEncoding(n_units) if use_posenc else None
+        
         for i in range(n_layers):
             setattr(
                 self,
@@ -280,9 +311,17 @@ class TransformerEncoder(Module):
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, F) ... batch, time, (mel)freq
+        B, T, _ = x.shape
         BT_size = x.shape[0] * x.shape[1]
         # e: (BT, F)
         e = self.linear_in(x.reshape(BT_size, -1))
+        
+        if self.pos_enc is not None:
+            # reshape back to (B, T, D) to apply positional signal
+            e = e.view(B, T, -1)
+            e = self.pos_enc(e)
+            e = e.view(BT_size, -1)
+        
         # Encoder stack
         for i in range(self.n_layers):
             # layer normalization
@@ -301,6 +340,9 @@ class TransformerEncoder(Module):
         # output: (BT, F)
         return self.lnorm_out(e)
 
+def _use_sort_loss(enc) -> bool:
+    """Return True if positional encoding is enabled in the encoder."""
+    return hasattr(enc, "pos_enc") and (enc.pos_enc is not None)
 
 class TransformerEDADiarization(Module):
 
@@ -318,7 +360,10 @@ class TransformerEDADiarization(Module):
         attractor_encoder_dropout: float,
         attractor_decoder_dropout: float,
         detach_attractor_loss: bool,
-    ) -> None: #def dummy():
+        use_posenc: bool = False,          # <--- add args here
+        hybrid_loss: bool = False,         # <--- add args here
+        hybrid_sort_weight: float = 0.5,   # <--- add args here
+    ) -> None: 
         """ Self-attention-based diarization model.
         Args:
           in_size (int): Dimension of input feature vector
@@ -330,6 +375,9 @@ class TransformerEDADiarization(Module):
           attractor_loss_ratio (float)
           attractor_encoder_dropout (float)
           attractor_decoder_dropout (float)
+          use_posenc (bool): use positional encoding for SortLoss
+          hybrid_loss (bool): enable hybrid PIT+Sort loss
+          hybrid_sort_weight (float): SortLoss weight λ (0–1)
         """
         self.device = device
         super(TransformerEDADiarization, self).__init__()
@@ -345,6 +393,11 @@ class TransformerEDADiarization(Module):
         )
         self.attractor_loss_ratio = attractor_loss_ratio
         self.vad_loss_weight = vad_loss_weight
+        
+        # === hybrid/sort flags ===
+        self.use_posenc = bool(use_posenc)
+        self.hybrid_loss = bool(hybrid_loss)
+        self.hybrid_sort_weight = max(0.0, min(1.0, float(hybrid_sort_weight)))
 
     def get_embeddings(self, xs: torch.Tensor) -> torch.Tensor: #def dummy():
         ilens = [x.shape[0] for x in xs]
@@ -416,25 +469,50 @@ class TransformerEDADiarization(Module):
 
     def get_loss(
         self,
-        ys: torch.Tensor,
-        target: torch.Tensor,
+        ys: torch.Tensor,                 # [B,T,S] logits
+        target: torch.Tensor,             # list/packed -> will be padded
         n_speakers: List[int],
         attractor_loss: torch.Tensor,
         vad_loss_weight: float,
         detach_attractor_loss: bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        max_n_speakers = max(n_speakers)
-        ts_padded = pad_labels(target, max_n_speakers)
-        ts_padded = torch.stack(ts_padded)
-        ys_padded = pad_labels(ys, max_n_speakers)
-        ys_padded = torch.stack(ys_padded)
+        # pad to same speaker dim
+        max_n_speakers = max(n_speakers) if len(n_speakers) else 0
+        ts_padded = torch.stack(pad_labels(target, max_n_speakers))  # [B,T,S]
+        ys_padded = torch.stack(pad_labels(ys,     max_n_speakers))  # [B,T,S]
 
-        loss = pit_loss_multispk(
-            ys_padded, ts_padded, n_speakers, detach_attractor_loss)
-        vad_loss_value = vad_loss(ys, target)
+        # --- decide core loss ---
+        if getattr(self, "hybrid_loss", False):
+            # Hybrid: PIT + SORT (weights sum to 1)
+            lam = float(getattr(self, "hybrid_sort_weight", 0.5))
+            lam = max(0.0, min(1.0, lam))  # clamp to [0,1]
 
-        return loss + vad_loss_value * vad_loss_weight + \
-            attractor_loss * self.attractor_loss_ratio, loss
+            sort_l = sort_loss_multispk(
+                ys_padded, ts_padded, n_speakers, detach_attractor_loss
+            )
+            pit_l = pit_loss_multispk(
+                ys_padded, ts_padded, n_speakers, detach_attractor_loss
+            )
+            core_only = (1.0 - lam) * pit_l + lam * sort_l
+
+        else:
+            # Single: use_posenc=True면 SORT, 아니면 PIT
+            use_sort = _use_sort_loss(self.enc)
+            if use_sort:
+                core_only = sort_loss_multispk(
+                    ys_padded, ts_padded, n_speakers, detach_attractor_loss
+                )
+            else:
+                core_only = pit_loss_multispk(
+                    ys_padded, ts_padded, n_speakers, detach_attractor_loss
+                )
+
+        # --- aux losses ---
+        vad = vad_loss(ys, target) * vad_loss_weight
+        total = core_only + vad + attractor_loss * self.attractor_loss_ratio
+
+        # return (total, core_only)
+        return total, core_only
 
 
 def pad_labels(ts: torch.Tensor, out_size: int) -> torch.Tensor:
@@ -465,14 +543,14 @@ class TransformerSCDEDADiarization(Module):
         dropout: float,
         vad_loss_weight: float,
         attractor_loss_ratio: float,
-        detach_attractor_loss: float,  # ✅ 디폴트 값 없음 → 앞에 배치
-        state_change_detector_dropout: float = 0.1,  # ✅ 디폴트 값 없음 → 앞에 배치
+        detach_attractor_loss: float,  
+        state_change_detector_dropout: float = 0.1,  
         seg_PIT_loss_ratio: float = 1.0,
         scd_loss_ratio: float = 1.0,
-        attractor_encoder_dropout: float = 0.1,  # ✅ 디폴트 값 있음 → 뒤에 배치
-        attractor_decoder_dropout: float = 0.1,  # ✅ 디폴트 값 있음 → 뒤에 배치
+        attractor_encoder_dropout: float = 0.1, 
+        attractor_decoder_dropout: float = 0.1, 
     ):
-        """ Transformer 기반 다중화자 다이어리제이션 모델 (EEND-EDA + SSCD) """
+        """ Transformer-based multi-speaker diarization model (EEND-EDA + SSCD) """
         self.device = device
 
         super(TransformerSCDEDADiarization, self).__init__()
@@ -653,8 +731,15 @@ class TransformerSCDEDADiarization(Module):
         ys_padded = pad_labels(ys, max_n_speakers)
         ys_padded = torch.stack(ys_padded)
 
-        loss = pit_loss_multispk(
-            ys_padded, ts_padded, n_speakers, detach_attractor_loss)
+        # choose PIT or SORT by positional encoding flag
+        if _use_sort_loss(self.enc):
+            loss = sort_loss_multispk(
+                ys_padded, ts_padded, n_speakers, detach_attractor_loss
+            )
+        else:
+            loss = pit_loss_multispk(
+                ys_padded, ts_padded, n_speakers, detach_attractor_loss
+            )
         vad_loss_value = vad_loss(ys, target)
 
         return loss
@@ -670,31 +755,211 @@ class TransformerSCDEDADiarization(Module):
     def create_state_change_labels(
         self, ts: torch.Tensor, ilens: torch.Tensor, near_n_frames: int = 1
     ) -> torch.Tensor: #def dummy():
-        """SSCD Labels 생성 (Gradient 없음)"""
+        """SSCD Labels generation ( No Gradient )"""
 
         batch_size, T, C = ts.shape  
 
-        # 🔹 **상태 변화 감지** (B, T-1)
-        diff = torch.any(ts[:, 1:] != ts[:, :-1], dim=2)  # 변화 감지 (더 정확한 방식)
+        # 🔹 ** Detect Speaker State change ** (B, T-1)
+        diff = torch.any(ts[:, 1:] != ts[:, :-1], dim=2) # detect difference beteween previous frame
         scd_labels = torch.cat([torch.zeros(batch_size, 1, device=ts.device), diff.float()], dim=1)
 
-        # 🔹 **ilens 위치에 상태 변화(1) 설정**
+        # 🔹 ** Setting last label as 1 **
         last_valid_idx = ilens - 1  
         mask = torch.zeros_like(scd_labels, dtype=torch.bool)
         mask = mask.scatter(1, last_valid_idx.unsqueeze(1), 1) 
     
-        scd_labels = scd_labels.masked_fill(mask, 1)  # ✅ .detach() 제거 (필요 없음)
+        scd_labels = scd_labels.masked_fill(mask, 1)  #  delete .detach() (not necessary)
 
-        # 🔹 **Max Pooling을 사용하여 주변 프레임 확장 (Gradient 없음)**
+        # 🔹 ** Using Max Pooling to make neighbor frames as 1( No Gradient )**
         scd_labels = scd_labels.unsqueeze(1)  # (B, 1, T)
         scd_labels = F.max_pool1d(scd_labels, kernel_size=2 * near_n_frames + 1, stride=1, padding=near_n_frames)
         scd_labels = scd_labels.squeeze(1)  # (B, T)
 
-        # ✅ **Gradient 방지**
+        # ✅ ** prevent Gradient flow **
         scd_labels = scd_labels.detach()
 
         return scd_labels
 
+############# Conformer based model #############
+class ConformerEncoder(Module):
+    """
+    Conformer wrapper that matches TransformerEncoder I/O.
+    In:  x (B, T, F)
+    Out: (B*T, D)
+    """
+    def __init__(
+        self,
+        device: torch.device,
+        idim: int,
+        n_layers: int,
+        n_units: int,
+        e_units: int,       # unused but kept for interface
+        n_heads: int,
+        dropout: float,
+        depthwise_kernel_size: int = 31,
+    ) -> None:
+        super().__init__()
+
+        self.device = device
+        self.n_units = n_units
+
+        # project input dim to model dim
+        self.linear_in = torch.nn.Linear(idim, n_units, device=self.device)
+        self.lnorm_in = torch.nn.LayerNorm(n_units, device=self.device)
+
+        # build conformer
+        self.conformer = Conformer(
+            input_dim=n_units,
+            num_heads=n_heads,
+            ffn_dim=e_units,  
+            num_layers=n_layers,
+            depthwise_conv_kernel_size=depthwise_kernel_size,
+            dropout=dropout,
+        )
+
+        self.lnorm_out = torch.nn.LayerNorm(n_units, device=self.device)
+
+    @staticmethod
+    def _infer_lengths(x: torch.Tensor) -> torch.Tensor:
+        """
+        infer valid lengths from padding value -1
+        x: (B, T, F)
+        return: (B,)
+        """
+        # frame is valid if any feature != -1
+        valid = (x != -1).any(dim=2)  # (B, T)
+        lengths = valid.sum(dim=1)    # (B,)
+        return lengths
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, T, F)
+        return: (B*T, D)
+        """
+        B, T, _ = x.shape
+
+        # project to model dim
+        h = self.linear_in(x)
+        h = self.lnorm_in(h)
+
+        # get lengths
+        B, T, _ = h.size()
+        
+        # fixed lenghts to T
+        lengths = torch.full(
+            (B,), T, dtype=torch.long, device=h.device
+        )
+
+        # conformer forward
+        h, _out_lengths = self.conformer(h, lengths)  # (B, T, D)
+
+        # final norm
+        h = self.lnorm_out(h)
+
+        # match TransformerEncoder output shape
+        return h.reshape(B * T, self.n_units)
+
+class ConformerEDADiarization(TransformerEDADiarization):
+    """
+    Same as TransformerEDADiarization but encoder is Conformer.
+    """
+    def __init__(
+        self,
+        device: torch.device,
+        in_size: int,
+        n_units: int,
+        e_units: int,
+        n_heads: int,
+        n_layers: int,
+        dropout: float,
+        vad_loss_weight: float,
+        attractor_loss_ratio: float,
+        attractor_encoder_dropout: float,
+        attractor_decoder_dropout: float,
+        detach_attractor_loss: bool,
+        depthwise_kernel_size: int = 31,
+    ) -> None:
+        super().__init__(
+            device=device,
+            in_size=in_size,
+            n_units=n_units,
+            e_units=e_units,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            dropout=dropout,
+            vad_loss_weight=vad_loss_weight,
+            attractor_loss_ratio=attractor_loss_ratio,
+            attractor_encoder_dropout=attractor_encoder_dropout,
+            attractor_decoder_dropout=attractor_decoder_dropout,
+            detach_attractor_loss=detach_attractor_loss,
+        )
+
+        # override encoder with conformer
+        self.enc = ConformerEncoder(
+            device=device,
+            idim=in_size,
+            n_layers=n_layers,
+            n_units=n_units,
+            e_units=e_units,
+            n_heads=n_heads,
+            dropout=dropout,
+            depthwise_kernel_size=depthwise_kernel_size,
+        )
+
+
+class ConformerSCDEDADiarization(TransformerSCDEDADiarization):
+    """
+    Same as TransformerSCDEDADiarization but encoder is Conformer.
+    """
+    def __init__(
+        self,
+        device: torch.device,
+        in_size: int,
+        n_units: int,
+        e_units: int,
+        n_heads: int,
+        n_layers: int,
+        dropout: float,
+        vad_loss_weight: float,
+        attractor_loss_ratio: float,
+        detach_attractor_loss: float,
+        state_change_detector_dropout: float = 0.1,
+        seg_PIT_loss_ratio: float = 1.0,
+        scd_loss_ratio: float = 1.0,
+        attractor_encoder_dropout: float = 0.1,
+        attractor_decoder_dropout: float = 0.1,
+        depthwise_kernel_size: int = 31,
+    ):
+        super().__init__(
+            device=device,
+            in_size=in_size,
+            n_units=n_units,
+            e_units=e_units,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            dropout=dropout,
+            vad_loss_weight=vad_loss_weight,
+            attractor_loss_ratio=attractor_loss_ratio,
+            detach_attractor_loss=detach_attractor_loss,
+            state_change_detector_dropout=state_change_detector_dropout,
+            seg_PIT_loss_ratio=seg_PIT_loss_ratio,
+            scd_loss_ratio=scd_loss_ratio,
+            attractor_encoder_dropout=attractor_encoder_dropout,
+            attractor_decoder_dropout=attractor_decoder_dropout,
+        )
+
+        # override encoder with conformer
+        self.enc = ConformerEncoder(
+            device=device,
+            idim=in_size,
+            n_layers=n_layers,
+            n_units=n_units,
+            e_units=e_units,
+            n_heads=n_heads,
+            dropout=dropout,
+            depthwise_kernel_size=depthwise_kernel_size,
+        )
+        
 def pad_sequence(
     features: List[torch.Tensor],
     labels: List[torch.Tensor],
@@ -829,7 +1094,16 @@ def get_model(args: SimpleNamespace) -> Module:
             attractor_decoder_dropout=args.attractor_decoder_dropout,
             detach_attractor_loss=args.detach_attractor_loss,
             vad_loss_weight=args.vad_loss_weight,
+            use_posenc=getattr(args, "use_posenc", False),
+            hybrid_loss=getattr(args, "hybrid_loss", False),
+            hybrid_sort_weight=float(getattr(args, "hybrid_sort_weight", 0.5)),
         )
+        model.enc.use_posenc = bool(getattr(args, "use_posenc", False))
+        model.enc.pos_enc = SinusoidalPositionalEncoding(model.enc.lnorm_in.normalized_shape[0]) \
+            if model.enc.use_posenc else None
+        model.hybrid_loss = bool(getattr(args, "hybrid_loss", False))
+        model.hybrid_sort_weight = float(getattr(args, "hybrid_sort_weight", 0.5))
+            
     elif args.model_type == 'TransformerSCDEDA':
         model = TransformerSCDEDADiarization(
             device=args.device,
@@ -844,9 +1118,70 @@ def get_model(args: SimpleNamespace) -> Module:
             attractor_decoder_dropout=args.attractor_decoder_dropout,
             detach_attractor_loss=args.detach_attractor_loss,
             vad_loss_weight=args.vad_loss_weight,
+            use_posenc=getattr(args, "use_posenc", False),
+            hybrid_loss=getattr(args, "hybrid_loss", False),
+            hybrid_sort_weight=float(getattr(args, "hybrid_sort_weight", 0.5)),
         )
+        model.enc.use_posenc = bool(getattr(args, "use_posenc", False))
+        model.enc.pos_enc = SinusoidalPositionalEncoding(model.enc.lnorm_in.normalized_shape[0]) \
+            if model.enc.use_posenc else None
+        model.hybrid_loss = bool(getattr(args, "hybrid_loss", False))
+        model.hybrid_sort_weight = float(getattr(args, "hybrid_sort_weight", 0.5))
+                    
+    elif args.model_type == 'ConformerEDA':
+        model = ConformerEDADiarization(
+            device=args.device,
+            in_size=args.feature_dim * (1 + 2 * args.context_size),
+            n_units=args.hidden_size,
+            e_units=args.encoder_units,
+            n_heads=args.transformer_encoder_n_heads,
+            n_layers=args.transformer_encoder_n_layers,
+            dropout=args.transformer_encoder_dropout,
+            vad_loss_weight=args.vad_loss_weight,
+            attractor_loss_ratio=args.attractor_loss_ratio,
+            attractor_encoder_dropout=args.attractor_encoder_dropout,
+            attractor_decoder_dropout=args.attractor_decoder_dropout,
+            detach_attractor_loss=args.detach_attractor_loss,
+            depthwise_kernel_size=getattr(args, "conformer_depthwise_kernel_size", 31),
+        )
+        use_pos = bool(getattr(args, "use_posenc", False))
+        model.use_posenc = use_pos                # base class flag
+        model.enc.use_posenc = use_pos            # encoder flag
+        model.enc.pos_enc = (
+            SinusoidalPositionalEncoding(model.enc.lnorm_in.normalized_shape[0])
+            if use_pos else None
+        )
+
+        model.hybrid_loss = bool(getattr(args, "hybrid_loss", False))
+        model.hybrid_sort_weight = float(getattr(args, "hybrid_sort_weight", 0.5))
+                    
+    elif args.model_type == 'ConformerSCDEDA':
+        model = ConformerSCDEDADiarization(
+            device=args.device,
+            in_size=args.feature_dim * (1 + 2 * args.context_size),
+            n_units=args.hidden_size,
+            e_units=args.encoder_units,
+            n_heads=args.transformer_encoder_n_heads,
+            n_layers=args.transformer_encoder_n_layers,
+            dropout=args.transformer_encoder_dropout,
+            vad_loss_weight=args.vad_loss_weight,
+            attractor_loss_ratio=args.attractor_loss_ratio,
+            detach_attractor_loss=args.detach_attractor_loss,
+            state_change_detector_dropout=getattr(args, "state_change_detector_dropout", 0.1),
+            seg_PIT_loss_ratio=getattr(args, "seg_PIT_loss_ratio", 1.0),
+            scd_loss_ratio=getattr(args, "scd_loss_ratio", 1.0),
+            attractor_encoder_dropout=args.attractor_encoder_dropout,
+            attractor_decoder_dropout=args.attractor_decoder_dropout,
+            depthwise_kernel_size=getattr(args, "conformer_depthwise_kernel_size", 31),
+        )
+        model.enc.use_posenc = bool(getattr(args, "use_posenc", False))
+        model.enc.pos_enc = SinusoidalPositionalEncoding(model.enc.lnorm_in.normalized_shape[0]) \
+            if model.enc.use_posenc else None
+        model.hybrid_loss = bool(getattr(args, "hybrid_loss", False))
+        model.hybrid_sort_weight = float(getattr(args, "hybrid_sort_weight", 0.5))
+                    
     else:
-        raise ValueError('Possible model_type is "TransformerEDA" or "TransformerSCDEDA')
+        raise ValueError('Possible model_type: "TransformerEDA", "TransformerSCDEDA", "ConformerEDA", "ConformerSCDEDA"')
     return model
 
 
@@ -877,12 +1212,11 @@ def average_checkpoints(device: torch.device, model: Module, models_path: str, e
     return out
 
 
-def average_states(
-    states_list: List[Dict[str, torch.Tensor]],
-    device: torch.device,
-) -> List[Dict[str, torch.Tensor]]:
+def average_states(states_list, device):
     qty = len(states_list)
-    avg_state = states_list[0]
+    # Copying the device on the first state
+    avg_state = {k: v.to(device).clone() for k, v in states_list[0].items()}
+
     for i in range(1, qty):
         for key in avg_state:
             avg_state[key] += states_list[i][key].to(device)

@@ -2,6 +2,7 @@
 
 # Copyright 2019 Hitachi, Ltd. (author: Yusuke Fujita)
 # Copyright 2022 Brno University of Technology (author: Federico Landini)
+# Copyright 2025 Human Interface Lab (author: C. Moon)
 # Licensed under the MIT license.
 
 from os.path import isfile, join
@@ -24,7 +25,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import logging
-
+import os
 
 """
 T: number of frames
@@ -36,12 +37,12 @@ B: mini-batch size
 class StateChangeDetector(Module):
     def __init__(self, n_units: int, dropout: float = 0.1, device: torch.device = torch.device("cpu")):
         """
-        CNN 기반 State Change Detector
+        CNN-based State Change Detector
 
         Args:
-            n_units (int): 입력 임베딩 차원
-            dropout (float): 드롭아웃 비율
-            device (torch.device): 실행할 디바이스 (기본값: "cpu")
+            n_units (int): input emb dim
+            dropout (float): drop out percentage
+            device (torch.device): device
         """
         super(StateChangeDetector, self).__init__()
         self.device = device
@@ -53,7 +54,7 @@ class StateChangeDetector(Module):
         self.to(device)
 
     def forward(self, xs: torch.Tensor) -> torch.Tensor: #def dummy():
-        """ State Change Probability 계산 """
+        """ Calculate State Change Probability """
         # print("already padded")
         # print("xs.shape: ", xs.shape)
         xs_transposed = xs.permute(0, 2, 1)  # (B, T, D) → (B, D, T)
@@ -64,7 +65,7 @@ class StateChangeDetector(Module):
         # print("h.shape: ", h.shape)
         h = h.permute(0, 2, 1)  # (B, D/2, T) → (B, T, D/2)
         
-        # ✅ `view()` 대신 `.reshape()` 사용하여 메모리 연속성 문제 해결
+        # Using reshape
         h = torch.tanh(self.detector_layer_2(h.reshape(-1, h.shape[-1])))
         # print("after second layer")
         # print("h.shape: ", h.shape)
@@ -76,7 +77,7 @@ class StateChangeDetector(Module):
         # print("after view")
         # print("h.shape: ", h.shape)
         
-        return h.squeeze(dim=-1)  # ✅ (B, T) 형태로 반환
+        return h.squeeze(dim=-1)  # (B, T) 
 
 class EncoderDecoderAttractor(Module):
     def __init__(
@@ -465,14 +466,14 @@ class TransformerSCDEDADiarization(Module):
         dropout: float,
         vad_loss_weight: float,
         attractor_loss_ratio: float,
-        detach_attractor_loss: float,  # ✅ 디폴트 값 없음 → 앞에 배치
-        state_change_detector_dropout: float = 0.1,  # ✅ 디폴트 값 없음 → 앞에 배치
+        detach_attractor_loss: float, 
+        state_change_detector_dropout: float = 0.1,  
         seg_PIT_loss_ratio: float = 1.0,
         scd_loss_ratio: float = 1.0,
-        attractor_encoder_dropout: float = 0.1,  # ✅ 디폴트 값 있음 → 뒤에 배치
-        attractor_decoder_dropout: float = 0.1,  # ✅ 디폴트 값 있음 → 뒤에 배치
+        attractor_encoder_dropout: float = 0.1, 
+        attractor_decoder_dropout: float = 0.1, 
     ):
-        """ Transformer 기반 다중화자 다이어리제이션 모델 (EEND-EDA + SSCD) """
+        """ Transformer-based multi-speaker diarization model (EEND-EDA + SSCD) """
         self.device = device
 
         super(TransformerSCDEDADiarization, self).__init__()
@@ -500,30 +501,13 @@ class TransformerSCDEDADiarization(Module):
         xs: torch.Tensor,
         args: SimpleNamespace
     ) -> List[torch.Tensor]:  # def dummy():
-        """
-        **GPU 기반 SSCD(State Change Detector) + EEND 다이어리제이션 추론**
-        
-        Args:
-            xs (torch.Tensor): 입력 오디오 임베딩 (B, T, D) (GPU에서 연산)
-            args (SimpleNamespace): 설정 값
-        
-        Returns:
-            List[torch.Tensor]: 다이어리제이션 결과 [(T, C), ...]
-        """
-        assert args.estimate_spk_qty_thr != -1 or args.estimate_spk_qty != -1, \
-            "Either 'estimate_spk_qty_thr' or 'estimate_spk_qty' must be defined."
 
-        device = xs.device  # ✅ GPU 디바이스 유지
-        emb, scd_logits, ilens = self.forward(xs)
+        assert args.estimate_spk_qty_thr != -1 or \
+            args.estimate_spk_qty != -1, \
+            "Either 'estimate_spk_qty_thr' or 'estimate_spk_qty' \
+            arguments have to be defined."
+        emb, ilens = self.get_embeddings(xs)
         ys_active = []
-
-        if isinstance(ilens, list):
-            ilens = torch.tensor(ilens, device=ts.device)
-            
-        # ✅ **SSCD 확률 계산 (GPU)**
-        scd_probs = torch.sigmoid(scd_logits)  # 🔥 리스트 대신 Tensor 사용 (연산 최적화)
-
-        # ✅ **화자 임베딩 순서 랜덤 셔플링 여부**
         if args.time_shuffle:
             orders = [np.arange(e.shape[0]) for e in emb]
             for order in orders:
@@ -532,193 +516,149 @@ class TransformerSCDEDADiarization(Module):
                 torch.stack([e[order] for e, order in zip(emb, orders)]))
         else:
             attractors, probs = self.eda.estimate(emb)
-
-        # ✅ **SSCD 확률을 기반으로 상태 변화 감지**
-        scd_threshold = getattr(args, "scd_threshold", 0.05)  # 🔥 안전한 속성 접근
-        refined_predictions = []
+            
+        new_embs = torch.zeros_like(emb, device=xs.device)
+        segment_counts = torch.zeros_like(emb, device=xs.device)
+        scd_logits = self.scd(emb)
+        scd_probs = torch.sigmoid(scd_logits)  # (B, T)
         
-        for idx in range(len(emb)):
-            try:
-                len, e, scd_prob, att = ilens[idx], emb[idx], scd_probs[idx], attractors[idx]
-
-                # 🔥 **상태 변화 검출 (GPU에서 처리)**
-                state_changes = torch.where(scd_prob > scd_threshold)[0]
-                state_changes = torch.cat([torch.tensor([0], device=device), state_changes, torch.tensor([e.shape[0] - 1], device=device)])
-                state_changes = torch.unique(state_changes)
-
-                # 🔥 **구간별 평균 임베딩을 계산하여 화자 예측 향상**
-                refined_pred = torch.zeros((e.shape[0], att.shape[0]), dtype=torch.float32, device=device)  # (T, C)
-                for start, end in zip(state_changes[:-1], state_changes[1:]):
-                    segment_emb = e[start:end].mean(dim=0, keepdim=True)  # 평균 임베딩
-                    refined_segment = torch.matmul(segment_emb, att.T)  # 구간별 화자 예측
-                    refined_pred[start:end] = torch.clamp(refined_segment, 0, 1)  # (T, C)
-
-                refined_predictions.append(refined_pred)
-            except Exception as err:
-                print(f"🔥 Error in refining predictions for index {idx}: {err}")
-                raise
+        scd_threshold = 0.05
+        state_change = scd_probs > scd_threshold
+        state_change[:,0] = True
         
-        print("✅ type of refined_predictions: ", type(refined_predictions))
+        batch_indices = torch.arange(len(ilens), device=xs.device)
+        if isinstance(ilens, list):
+            ilens = torch.tensor(ilens, device=xs.device)
+        last_indices = ilens-1
+
+        state_change[batch_indices, last_indices] = True  
         
-        # ✅ **화자 수 추정 및 최종 다이어리제이션 결과 생성**
-        ys = refined_predictions
+        state_changes = torch.cumsum(state_change.int(), dim=1) - 1
+        
+        new_segment_embs = torch.zeros_like(emb, device=xs.device)
+        segment_counts = torch.zeros_like(state_changes, device=xs.device)
+        
+        segment_lengths = torch.ones_like(state_changes)
+        segment_counts = segment_counts.scatter_add(1, state_changes, segment_lengths)
+        segment_counts = segment_counts.gather(1, state_changes)
+
+        new_segment_embs = new_segment_embs.scatter_add(1,state_changes.unsqueeze(-1).expand_as(emb), emb)
+        new_segment_embs = new_segment_embs.gather(1, state_changes.unsqueeze(-1).expand_as(emb))
+        
+        new_segment_embs = new_segment_embs / segment_counts.unsqueeze(-1)
+                
+        ys = torch.matmul(new_segment_embs, attractors.permute(0, 2, 1))
+        ys = [torch.sigmoid(y) for y in ys]
         for p, y in zip(probs, ys):
             if args.estimate_spk_qty != -1:
-                # 🚀 화자 수 고정 (`estimate_spk_qty`)
                 sorted_p, order = torch.sort(p, descending=True)
                 ys_active.append(y[:, order[:args.estimate_spk_qty]])
             elif args.estimate_spk_qty_thr != -1:
-                # 🚀 특정 확률 임계값(`estimate_spk_qty_thr`) 이하인 화자 제외
-                silence = torch.where(p < args.estimate_spk_qty_thr)[0]
-                n_spk = silence[0] if silence.numel() > 0 else None
+                silence = np.where(
+                    p.data.to("cpu") < args.estimate_spk_qty_thr)[0]
+                n_spk = silence[0] if silence.size else None
                 ys_active.append(y[:, :n_spk])
             else:
-                raise NotImplementedError('estimate_spk_qty or estimate_spk_qty_thr must be set.')
-
+                NotImplementedError(
+                    'estimate_spk_qty or estimate_spk_qty_thr needed.')
         return ys_active
 
-    def forward(self, xs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:  # def dummy():
-        """
-        **Transformer Encoder + SSCD Forward Pass**
+    def forward(
+        self,
+        xs: torch.Tensor,
+        ts: torch.Tensor,
+        n_speakers: List[int],
+        args: SimpleNamespace,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: #def dummy():
         
-        Args:
-            xs (torch.Tensor): 입력 오디오 임베딩 (B, T, D)
-        
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, List[int]]: 
-                - emb (B, T, D) : Transformer Encoder 출력 임베딩
-                - scd_logits (B, T): 상태 변화 검출 로짓 (State Change Detector)
-                - ilens (List[int]): 입력 길이 리스트
-        """
-        emb, ilens = self.get_embeddings(xs)  # 🔥 Transformer Encoder를 통한 임베딩 추출
-        scd_logits = self.scd(emb)  # 🔥 상태 변화 검출 로짓 계산
+        emb, ilens = self.get_embeddings(xs)
+        if isinstance(ilens, list):
+            ilens = torch.tensor(ilens, device=ts.device)
+         
+        scd_logits = self.scd(emb)  # (B, T, 1)
+        scd_probs = torch.sigmoid(scd_logits)  # (B, T)
 
-        return emb, scd_logits, ilens
+        
+        scd_labels = self.create_state_change_labels(ts, ilens)  # (B, T)
+        scd_loss = F.binary_cross_entropy_with_logits(scd_logits, scd_labels)  # (B, T)
+        
+        scd_threshold = 0.05
+        state_change = scd_probs > scd_threshold
+        state_change[:,0] = True
+        
+        batch_indices = torch.arange(len(ilens), device=xs.device)
+        last_indices = ilens-1
+
+        state_change[batch_indices, last_indices] = True  
+        
+        state_changes = torch.cumsum(state_change.int(), dim=1) - 1
+        
+        new_segment_embs = torch.zeros_like(emb, device=xs.device)
+        segment_counts = torch.zeros_like(state_changes, device=xs.device)
+        
+        segment_lengths = torch.ones_like(state_changes)
+        segment_counts = segment_counts.scatter_add(1, state_changes, segment_lengths)
+        segment_counts = segment_counts.gather(1, state_changes)
+        
+        new_segment_embs = new_segment_embs.scatter_add(1,state_changes.unsqueeze(-1).expand_as(emb), emb)
+        new_segment_embs = new_segment_embs.gather(1, state_changes.unsqueeze(-1).expand_as(emb))
+        
+        new_segment_embs = new_segment_embs / segment_counts.unsqueeze(-1)
+
+        # if torch.equal(new_segment_embs, emb) : 
+        #     if torch.all(segment_counts == 1):
+        #         print("all is same so it is good")
+        #     else:
+        #         raise ValueError("all is same but it is not good")
+        # else:
+        #     if torch.all(segment_counts == 1):
+        #         raise ValueError("all is not same but it is not good")
+        #     else:
+        #         print("all is not same so it is good")
+
+        if torch.equal(new_segment_embs, emb):
+            if not torch.all(segment_counts == 1):
+                raise ValueError("all is same but it is not good")
+        else:
+            if torch.all(segment_counts == 1):
+                raise ValueError("all is not same but it is not good")
+        
+        if args.time_shuffle:
+            orders = [np.arange(e.shape[0]) for e in emb]
+            for order in orders:
+                np.random.shuffle(order)
+            attractor_loss, attractors = self.eda(
+                torch.stack([e[order] for e, order in zip(emb, orders)]),
+                n_speakers)
+        else:
+            attractor_loss, attractors = self.eda(emb, n_speakers)
+
+        ys = torch.matmul(emb, attractors.permute(0, 2, 1))
+        seg_ys = torch.matmul(new_segment_embs, attractors.permute(0, 2, 1))
+        
+        return ys, seg_ys, attractor_loss, scd_loss
 
     def get_loss(
         self,
-        xs: torch.Tensor,  # (Batch, T, D)
-        ts: torch.Tensor,  # (Batch, T, C)
+        ys: torch.Tensor,
+        target: torch.Tensor,
         n_speakers: List[int],
-        args: SimpleNamespace,
-        detach_attractor_loss: bool,
+        attractor_loss: torch.Tensor,
+        vad_loss_weight: float,
+        detach_attractor_loss: bool
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  #def dummy():
 
-        """ **손실 계산 함수 (Batch × T × C 입력)** """
-
-        emb, scd_logits, ilens = self.forward(xs)  # (Batch, T, D), (Batch, T, 1)
-        device = xs.device
-
-        if isinstance(ilens, list):
-            ilens = torch.tensor(ilens, device=ts.device)
-
-        # ✅ **Attractor Loss 계산**
-        attractor_loss, attractors = self.eda(emb, n_speakers)
-
-        # ✅ **PIT Loss (프레임 단위)**
-        ys = torch.matmul(emb, attractors.permute(0, 2, 1))  # (Batch, T, C)
         max_n_speakers = max(n_speakers)
-        
-        ts_padded = torch.stack(pad_labels(ts, max_n_speakers))  
-        ys_padded = torch.stack(pad_labels(ys, max_n_speakers))  
-        
-        output_mask = self.create_length_mask(ilens, ts_padded.shape[1], ts_padded.shape[2])        
-        ys_padded = ys_padded * output_mask
-        
-        frame_PIT_loss = pit_loss_multispk(ys_padded, ts_padded, n_speakers, detach_attractor_loss)
-            
-        # ✅ **SSCD Loss (State Change Detector Loss)**    
-        scd_mask = self.create_length_mask(ilens, scd_logits.shape[1], 1)
-        scd_mask = scd_mask.squeeze(-1)
-     
-        scd_labels = self.create_state_change_labels(ts_padded, ilens)
-        scd_logits = scd_logits * scd_mask
-        
-        scd_loss = F.binary_cross_entropy_with_logits(scd_logits, scd_labels)
+        ts_padded = pad_labels(target, max_n_speakers)
+        ts_padded = torch.stack(ts_padded)
+        ys_padded = pad_labels(ys, max_n_speakers)
+        ys_padded = torch.stack(ys_padded)
 
-        # ✅ **Segment PIT Loss (SSCD 기반 Segmentation)**
-        scd_probs = torch.sigmoid(scd_logits)
-        scd_threshold = 0.05  
-        state_change_mask = scd_probs > scd_threshold  
-        state_change_mask[:, 0] = True  
+        loss = pit_loss_multispk(
+            ys_padded, ts_padded, n_speakers, detach_attractor_loss)
+        vad_loss_value = vad_loss(ys, target)
 
-        batch_indices = torch.arange(len(ilens), device=device)
-        last_indices = (ilens - 1).clamp(min=0)
-        state_change_mask[batch_indices, last_indices] = True  
-
-        # 🔹 state_changes 추출
-        state_changes = torch.nonzero(state_change_mask)[1]  
-
-        # if is_main_process:
-        #     print(f"state_changes before filtering: {state_changes}")
-
-        # ✅ 유효한 인덱스만 유지하도록 필터링
-        max_valid_index = emb.shape[1]  
-        valid_mask = (state_changes >= 0) & (state_changes < max_valid_index)
-
-        # if not valid_mask.all() and is_main_process:
-        #     print(f"🚨 Invalid indices found in state_changes! Filtering out invalid values.")
-
-        state_changes = state_changes[valid_mask]
-
-        # ✅ **scatter_add_()로 segment-wise 평균 계산**
-        state_changes = torch.cumsum(state_change_mask.int(), dim=1) - 1
-    
-        state_changes = state_changes.clamp(min=0, max=emb.shape[1] - 1)  
-
-        # if is_main_process:
-        #     print(f"state_changes min: {state_changes.min()}, max: {state_changes.max()}, shape: {state_changes.shape}")
-
-        new_segment_embs = torch.zeros_like(emb, device=device)  
-        segment_counts = torch.zeros_like(state_changes, dtype=torch.float32, device=device)
-
-        segment_counts = segment_counts.clone().scatter_add(1, state_changes, torch.ones_like(state_changes, dtype=torch.float32))
-        # if is_main_process:
-        #     print(f"segment_counts min: {segment_counts.min()}, max: {segment_counts.max()}, shape: {segment_counts.shape}")
-        #     print(f"Before scatter_add new_segment_embs[0, :5, :] = {new_segment_embs[0, :5, :]}")
-        #     print(f"Before scatter_add: segment_counts[0,30] = {segment_counts[0,30]}")
-
-        new_segment_embs = new_segment_embs.clone().scatter_add(1, state_changes.unsqueeze(-1).expand_as(emb), emb)
-
-        # if is_main_process:
-        #     print(f"After scatter_add new_segment_embs[0, :5, :] = {new_segment_embs[0, :5, :]}")
-
-        segment_counts = segment_counts.clamp(min=1).clone()  
-        new_segment_embs = new_segment_embs / segment_counts.unsqueeze(-1)
-                
-        # if is_main_process:
-        #     print(f"Segment counts unique values: {segment_counts.unique()}")
-        #     for i in range(16):
-            #     print("segment_counts[i,:] :", segment_counts[i,:])
-            # print(f"new_segment_embs[0, :10, :] = {new_segment_embs[0, :10, :]}")
-            # print(f"Final new_segment_embs[0,30,:] = {new_segment_embs[0,30,:]}")
-
-        # 🔹 refined_segment 계산
-        refined_segment = torch.matmul(new_segment_embs, attractors.permute(0, 2, 1))
-        refined_segment = refined_segment.gather(1, state_changes.unsqueeze(-1).expand(-1, -1, refined_segment.shape[2]))
-        ys = ys * output_mask
-        
-        refined_segment = refined_segment * output_mask
-
-        seg_PIT_loss = pit_loss_multispk(refined_segment, ts_padded, n_speakers, detach_attractor_loss)
-
-        print(f"emb shape: {emb.shape}, expanded state_changes shape: {state_changes.unsqueeze(-1).expand_as(emb).shape}")
-        print(f"segment_counts max: {segment_counts.max()}, min: {segment_counts.min()}")
-        print(f"segment_counts.shape: {segment_counts.shape}")  
-        print("state_changes[0,:]: ", state_changes[0,:])
-        print("segment_counts[0,:]: ", segment_counts[0,:])
-        print("new_segment_embs[0,:30,:]: ", new_segment_embs[0,:30,:])
-        print("emb[0,:30,:]: ", emb[0,:30,:])
-
-        # ✅ **최종 손실 합산**
-        total_loss = (
-            frame_PIT_loss
-            + seg_PIT_loss
-            # + attractor_loss
-            # + scd_loss
-        )
-
-        return refined_segment, total_loss, frame_PIT_loss, attractor_loss
+        return loss
     
     def create_length_mask(self, length, max_len, num_output):
         batch_size = len(length)
@@ -731,27 +671,27 @@ class TransformerSCDEDADiarization(Module):
     def create_state_change_labels(
         self, ts: torch.Tensor, ilens: torch.Tensor, near_n_frames: int = 1
     ) -> torch.Tensor: #def dummy():
-        """SSCD Labels 생성 (Gradient 없음)"""
+        """SSCD Labels generation ( No Gradient )"""
 
         batch_size, T, C = ts.shape  
 
-        # 🔹 **상태 변화 감지** (B, T-1)
-        diff = torch.any(ts[:, 1:] != ts[:, :-1], dim=2)  # 변화 감지 (더 정확한 방식)
+        # 🔹 ** Detect Speaker State change ** (B, T-1)
+        diff = torch.any(ts[:, 1:] != ts[:, :-1], dim=2) # detect difference beteween previous frame
         scd_labels = torch.cat([torch.zeros(batch_size, 1, device=ts.device), diff.float()], dim=1)
 
-        # 🔹 **ilens 위치에 상태 변화(1) 설정**
+        # 🔹 ** Setting last label as 1 **
         last_valid_idx = ilens - 1  
         mask = torch.zeros_like(scd_labels, dtype=torch.bool)
         mask = mask.scatter(1, last_valid_idx.unsqueeze(1), 1) 
     
-        scd_labels = scd_labels.masked_fill(mask, 1)  # ✅ .detach() 제거 (필요 없음)
+        scd_labels = scd_labels.masked_fill(mask, 1)  #  delete .detach() (not necessary)
 
-        # 🔹 **Max Pooling을 사용하여 주변 프레임 확장 (Gradient 없음)**
+        # 🔹 ** Using Max Pooling to make neighbor frames as 1( No Gradient )**
         scd_labels = scd_labels.unsqueeze(1)  # (B, 1, T)
         scd_labels = F.max_pool1d(scd_labels, kernel_size=2 * near_n_frames + 1, stride=1, padding=near_n_frames)
         scd_labels = scd_labels.squeeze(1)  # (B, T)
 
-        # ✅ **Gradient 방지**
+        # ✅ ** prevent Gradient flow **
         scd_labels = scd_labels.detach()
 
         return scd_labels
@@ -786,35 +726,88 @@ def pad_sequence(
     return features_padded, labels_padded
 
 
-def save_checkpoint(
-    args,
-    epoch: int,
-    model: Module,
-    optimizer: NoamOpt,
-    loss: torch.Tensor
-) -> None:
-    Path(f"{args.output_path}/models").mkdir(parents=True, exist_ok=True)
+def _ckpt_path(output_dir: str, epoch: int) -> str:
+    os.makedirs(os.path.join(output_dir, "models"), exist_ok=True)
+    return os.path.join(output_dir, "models", f"checkpoint_{epoch}.tar")
 
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss},
-        f"{args.output_path}/models/checkpoint_{epoch}.tar"
-    )
+def save_checkpoint(args, epoch, model, optimizer, loss):
+    """Save model + optimizer state.
+    - If optimizer is a Noam wrapper, also save inner Adam and Noam states.
+    """
+    path = _ckpt_path(args.output_path, epoch)
 
+    # model state
+    model_state = model.state_dict()
 
-def load_checkpoint(args: SimpleNamespace, filename: str):
-    model = get_model(args)
-    optimizer = setup_optimizer(args, model)
+    # optimizer state
+    # If it looks like a Noam wrapper, it has an inner `.optimizer`
+    if hasattr(optimizer, "optimizer"):
+        opt_inner_state = optimizer.optimizer.state_dict()   # inner Adam/SGD
+        noam_state = optimizer.state_dict()                  # step, warmup, etc.
+        ckpt = {
+            "epoch": epoch,
+            "model_state": model_state,
+            "optimizer_state": opt_inner_state,
+            "noam_state": noam_state,
+            "loss": float(getattr(loss, "item", lambda: loss)()),
+        }
+    else:
+        ckpt = {
+            "epoch": epoch,
+            "model_state": model_state,
+            "optimizer_state": optimizer.state_dict(),
+            "loss": float(getattr(loss, "item", lambda: loss)()),
+        }
 
-    assert isfile(filename), \
-        f"File {filename} does not exist."
-    checkpoint = torch.load(filename)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    epoch = checkpoint['epoch']
-    loss = checkpoint['loss']
+    torch.save(ckpt, path)
+    return path  # for logging if needed
+
+# === add this helper ===
+def _fix_prefix_for_ddp(state_dict: dict, target_state_dict_keys) -> dict:
+    has_module_in_ckpt  = any(k.startswith("module.") for k in state_dict.keys())
+    has_module_in_model = any(k.startswith("module.") for k in target_state_dict_keys)
+    if has_module_in_ckpt and not has_module_in_model:
+        return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    elif not has_module_in_ckpt and has_module_in_model:
+        return {f"module.{k}": v for k, v in state_dict.items()}
+    else:
+        return state_dict
+
+def load_checkpoint(args, path, model, optimizer):
+    """Load model + optimizer state.
+    - Supports both 'model_state' and 'model_state_dict'
+    - Aligns DDP 'module.' prefix automatically
+    - Restores inner Adam state and Noam wrapper state if present
+    Returns: (epoch, model, optimizer, loss)
+    """
+    ckpt = torch.load(path, map_location=getattr(args, "device", "cpu"))
+
+    # ---- model ----
+    raw_model_state = ckpt.get("model_state", None)
+    if raw_model_state is None:
+        raw_model_state = ckpt.get("model_state_dict", None)
+    if raw_model_state is None:
+        raise KeyError(f"Checkpoint {path} has neither 'model_state' nor 'model_state_dict'.")
+
+    fixed_state = _fix_prefix_for_ddp(raw_model_state, model.state_dict().keys())
+    model.load_state_dict(fixed_state)
+
+    # ---- optimizer ----
+    if hasattr(optimizer, "optimizer"):
+        # Noam wrapper case
+        opt_state = ckpt.get("optimizer_state", None)
+        if opt_state is not None:
+            optimizer.optimizer.load_state_dict(opt_state)
+        noam_state = ckpt.get("noam_state", None)
+        if noam_state is not None:
+            optimizer.load_state_dict(noam_state)
+    else:
+        opt_state = ckpt.get("optimizer_state", None)
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+
+    epoch = int(ckpt.get("epoch", 0))
+    loss = ckpt.get("loss", None)
     return epoch, model, optimizer, loss
 
 
@@ -858,25 +851,31 @@ def get_model(args: SimpleNamespace) -> Module:
     return model
 
 
-def average_checkpoints(
-    device: torch.device,
-    model: Module,
-    models_path: str,
-    epochs: str
-) -> Module:
-    epochs = parse_epochs(epochs)
-    states_dict_list = []
-    for e in epochs:
-        copy_model = copy.deepcopy(model)
-        checkpoint = torch.load(join(
-            models_path,
-            f"checkpoint_{e}.tar"), map_location=device)
-        copy_model.load_state_dict(checkpoint['model_state_dict'])
-        states_dict_list.append(copy_model.state_dict())
-    avg_state_dict = average_states(states_dict_list, device)
-    avg_model = copy.deepcopy(model)
-    avg_model.load_state_dict(avg_state_dict)
-    return avg_model
+def average_checkpoints(device: torch.device, model: Module, models_path: str, epochs: str) -> Module:
+    epoch_list = parse_epochs(epochs)  # e.g., "1,2,3" or "0-4"
+    states = []
+    model_keys = model.state_dict().keys()
+
+    for e in epoch_list:
+        ckpt_path = join(models_path, f"checkpoint_{e}.tar")
+        ckpt = torch.load(ckpt_path, map_location=device)
+
+        raw_model_state = ckpt.get("model_state", None)
+        if raw_model_state is None:
+            raw_model_state = ckpt.get("model_state_dict", None)
+        if raw_model_state is None:
+            raise KeyError(f"{ckpt_path} has neither 'model_state' nor 'model_state_dict'.")
+
+        fixed_state = _fix_prefix_for_ddp(raw_model_state, model_keys)
+
+        tmp = copy.deepcopy(model)
+        tmp.load_state_dict(fixed_state)
+        states.append(tmp.state_dict())
+
+    avg_state = average_states(states, device)
+    out = copy.deepcopy(model)
+    out.load_state_dict(avg_state)
+    return out
 
 
 def average_states(

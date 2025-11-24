@@ -2,6 +2,7 @@
 
 # Copyright 2019 Hitachi, Ltd. (author: Yusuke Fujita)
 # Copyright 2022 Brno University of Technology (authors: Federico Landini)
+# Copyright 2025 Human Interface Lab (author: C. Moon)
 # Licensed under the MIT license.
 
 
@@ -12,6 +13,11 @@ from backend.models import (
     pad_labels,
     pad_sequence,
     save_checkpoint,
+)
+from backend.losses import (
+    pit_loss_multispk,
+    sort_loss_multispk,
+    vad_loss,
 )
 from backend.updater import setup_optimizer, get_rate
 from common_utils.diarization_dataset import KaldiDiarizationDataset
@@ -29,6 +35,15 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 import numpy as np
 import os
+
+# === torchrun setup ===
+os.environ.setdefault("NCCL_DEBUG", "WARN")
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("NCCL_BLOCKING_WAIT", "1")
+os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
+os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+# === torchrun setup ===  
+
 import random
 import torch
 import logging
@@ -59,8 +74,11 @@ from torch.utils.data.distributed import DistributedSampler
 def is_dist_avail_and_initialized():
     return dist.is_available() and dist.is_initialized()
 
-def get_world_size():
-    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+def get_world_size() -> int:
+    if not is_dist_avail_and_initialized():
+        return 1
+    return dist.get_world_size()
 
 def get_rank():
     return dist.get_rank() if is_dist_avail_and_initialized() else 0
@@ -68,17 +86,50 @@ def get_rank():
 def is_main_process():
     return get_rank() == 0
 
-def setup_ddp(backend="nccl"):
-    # torchrun injects LOCAL_RANK / RANK / WORLD_SIZE
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    dist.init_process_group(backend=backend, init_method="env://")
-    torch.cuda.set_device(local_rank)
+def setup_ddp(backend: str) -> int:
+    """
+        DDP init for torchrun only:
+        - torchrun sets env vars: RANK / WORLD_SIZE / LOCAL_RANK / MASTER_ADDR / MASTER_PORT
+        - we just use them and call init_process_group("env://")
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        # single-process / single-GPU
+        return 0
+
+    if "RANK" not in os.environ or "LOCAL_RANK" not in os.environ:
+        raise RuntimeError(
+            "To use DDP, you must run with torchrun."
+            "e.g., torchrun --nproc_per_node=2 eend/train.py …"
+        )
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
+    # Do not set init_method; use the env (MASTER_ADDR/PORT) provided by torchrun.
+    dist.init_process_group(
+        backend=backend,
+        init_method="env://",
+        rank=rank,
+        world_size=world_size,
+    )
+
     return local_rank
 
 def cleanup_ddp():
     if is_dist_avail_and_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+        try:
+            dist.barrier(timeout=timedelta(seconds=10))
+        except Exception:
+            pass
+        finally:
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
 # === DDP IMPORTS END ===
 
@@ -103,7 +154,6 @@ def safe_load_checkpoint(args, path, model, optimizer, retries: int = 3, wait: f
     raise last_err
 
 # === CHECKPOINT ===
-
 
 def setup_logging(output_path: str):
     os.makedirs(output_path, exist_ok=True)
@@ -224,46 +274,131 @@ def compute_loss_and_metrics(
     # unwrap for custom methods/attrs (e.g., get_loss)
     base_model = model.module if hasattr(model, "module") else model
 
-    if model_type == "TransformerEDA":
-        y_pred, attractor_loss = model(input, labels, n_speakers, args)  # forward는 DDP로 호출
-        loss, standard_loss = base_model.get_loss(  # <-- 여기!
+    if model_type in ("TransformerEDA", "ConformerEDA"):
+        # forward -> logits and attractor aux
+        y_pred, attractor_loss = model(input, labels, n_speakers, args)
+
+        # get PIT-based losses: total and PIT-only
+        total_loss, pit_only = base_model.get_loss(
             y_pred, labels, n_speakers, attractor_loss, vad_loss_weight,
-            detach_attractor_loss)
+            detach_attractor_loss
+        )
+        extra_terms = total_loss - pit_only  # e.g., vad/attractor parts
+
+        # decide hybrid weights
+        pit_w, sort_w = get_hybrid_weights(args)
+
+        # enable sort only if encoder has positional encoding
+        enc = base_model.enc if hasattr(base_model, "enc") else None
+        posenc_enabled = (enc is not None) and getattr(enc, "pos_enc", None) is not None
+
+        # compute sort loss if enabled
+        if sort_w > 0.0 and posenc_enabled:
+            nspk_t = torch.as_tensor(n_speakers, device=labels.device)
+            s_loss = sort_loss_multispk(y_pred, labels, nspk_t, detach_attractor_loss=False)
+        else:
+            s_loss = torch.tensor(0.0, device=labels.device)
+
+        # hybrid core and final loss
+        hybrid_core = pit_w * pit_only + sort_w * s_loss
+        loss = hybrid_core + extra_terms
+
+        # metrics (thresholded for DER)
         metrics = calculate_metrics(labels.detach(), y_pred.detach(), threshold=0.5)
+
+        # optional arrival-order metrics if posenc exists
+        if posenc_enabled and 'calculate_metrics_arrival_order' in globals():
+            ao = calculate_metrics_arrival_order(labels.detach(), y_pred.detach(), threshold=0.5)
+            metrics.update(ao)
+
+        # accumulate
         acum_metrics = update_metrics(acum_metrics, metrics)
-        acum_metrics['loss'] += loss.item()
-        acum_metrics['loss_standard'] += standard_loss.item()
-        acum_metrics['loss_attractor'] += attractor_loss.item()
-        batch_log = {"loss": float(loss.item()),
-                     "DER": float(metrics.get("DER", float("nan")))}
+        acum_metrics['loss'] += float(loss.item())
+        acum_metrics['loss_standard'] += float(pit_only.item())       # PIT-only (before extra)
+        acum_metrics['loss_attractor'] += float(attractor_loss.item()) # keep old tracking
+        if sort_w > 0.0 and posenc_enabled:
+            acum_metrics['loss_sort'] = acum_metrics.get('loss_sort', 0.0) + float(s_loss.item())
+
+        # logging payload
+        core_tag = (
+            f"Hybrid(λ={base_model.hybrid_sort_weight:.2f})"
+            if base_model.hybrid_loss else
+            ("Sort" if base_model.use_posenc else "PIT")
+        )
+        batch_log = {
+            "loss": float(loss.item()),
+            "DER": float(metrics.get("DER", float("nan"))),
+            "DER_arrival": float(metrics.get("DER_arrival", float("nan"))) if 'DER_arrival' in metrics else float('nan'),
+            "core": core_tag
+        }
         return loss, acum_metrics, batch_log
 
-    elif model_type == "TransformerSCDEDA":
+    elif model_type in ("TransformerSCDEDA", "ConformerSCDEDA"):
+        # forward -> logits, segment logits, and aux losses
         y_pred, seg_y_pred, attractor_loss, scd_loss = model(input, labels, n_speakers, args)
-        standard_loss = base_model.get_loss(  # <-- 여기!
+
+        # main stream PIT: total and PIT-only
+        total_main, pit_only_main = base_model.get_loss(
             y_pred, labels, n_speakers, attractor_loss, vad_loss_weight,
-            detach_attractor_loss)
-        seg_PIT_loss = base_model.get_loss(  # <-- 여기!
+            detach_attractor_loss
+        )
+        extra_main = total_main - pit_only_main
+
+        # segment PIT (unchanged)
+        seg_total, seg_pit_only = base_model.get_loss(
             seg_y_pred, labels, n_speakers, attractor_loss, vad_loss_weight,
-            detach_attractor_loss)
-        loss = standard_loss + seg_PIT_loss + scd_loss + attractor_loss
+            detach_attractor_loss
+        )
+
+        # decide hybrid weights for main stream only
+        pit_w, sort_w = get_hybrid_weights(args)
+        enc = base_model.enc if hasattr(base_model, "enc") else None
+        posenc_enabled = (enc is not None) and getattr(enc, "pos_enc", None) is not None
+
+        if sort_w > 0.0 and posenc_enabled:
+            nspk_t = torch.as_tensor(n_speakers, device=labels.device)
+            s_loss = sort_loss_multispk(y_pred, labels, nspk_t, detach_attractor_loss=False)
+        else:
+            s_loss = torch.tensor(0.0, device=labels.device)
+
+        # hybrid on main stream only
+        main_core = pit_w * pit_only_main + sort_w * s_loss
+        main_loss = main_core + extra_main
+
+        # final loss composition
+        loss = main_loss + seg_total + scd_loss + attractor_loss
+
+        # metrics use segment predictions (as before)
         metrics = calculate_metrics(labels.detach(), seg_y_pred.detach(), threshold=0.5)
         acum_metrics = update_metrics(acum_metrics, metrics)
-        acum_metrics['loss'] += loss.item()
-        acum_metrics['loss_standard'] += standard_loss.item()
-        acum_metrics['loss_attractor'] += attractor_loss.item()
-        acum_metrics['loss_scd'] += scd_loss.item()
-        acum_metrics['loss_seg_PIT'] += seg_PIT_loss.item()
+        acum_metrics['loss'] += float(loss.item())
+        acum_metrics['loss_standard'] += float(pit_only_main.item())
+        acum_metrics['loss_attractor'] += float(attractor_loss.item())
+        acum_metrics['loss_scd'] += float(scd_loss.item())
+        acum_metrics['loss_seg_PIT'] += float(seg_total.item())
+        if sort_w > 0.0 and posenc_enabled:
+            acum_metrics['loss_sort'] = acum_metrics.get('loss_sort', 0.0) + float(s_loss.item())
+
         batch_log = {
             "loss": float(loss.item()),
             "DER": float(metrics.get("DER", float("nan"))),
             "loss_scd": float(scd_loss.item()),
-            "loss_seg_PIT": float(seg_PIT_loss.item()),
+            "loss_seg_PIT": float(seg_total.item()),
+            "core": ("Hybrid(λ={:.2f})".format(sort_w)) if (sort_w > 0.0 and posenc_enabled) else "PIT"
         }
         return loss, acum_metrics, batch_log
 
     else:
         raise ValueError(f"Unknown model type: {model_type}. Please use TransformerEDA or TransformerSCDEDA.")
+
+
+def get_hybrid_weights(args):
+    """Return (pit_w, sort_w). Clamp to [0,1] and sum to 1."""
+    if not getattr(args, 'hybrid_loss', False):
+        return 1.0, 0.0  # pure PIT
+    lam = float(getattr(args, 'hybrid_sort_weight', 0.3))
+    lam = max(0.0, min(1.0, lam))
+    return (1.0 - lam), lam
 
 def get_training_dataloaders(
     args: SimpleNamespace 
@@ -317,8 +452,8 @@ def get_training_dataloaders(
     # === DDP SAMPLERS ===
     use_ddp = getattr(args, "ddp", False) and get_world_size() > 1
 
-    train_sampler = DistributedSampler(train_set, get_world_size(), get_rank(), shuffle=True) if use_ddp else None
-    dev_sampler   = DistributedSampler(dev_set,   get_world_size(), get_rank(), shuffle=False) if use_ddp else None
+    train_sampler = DistributedSampler(train_set, get_world_size(), get_rank(), shuffle=True, drop_last=True) if use_ddp else None
+    dev_sampler   = DistributedSampler(dev_set,   get_world_size(), get_rank(), shuffle=False, drop_last=True) if use_ddp else None
                    
     train_loader = DataLoader(
         train_set,
@@ -428,6 +563,11 @@ def parse_arguments() -> SimpleNamespace: #def dummy():
     parser.add_argument('--valid-data-dir',
                         help='kaldi-style data dir used for validation.')
 
+    ## parser for Conformer
+    parser.add_argument('--conformer-depthwise-kernel-size', type=int, default=32,
+                    help='depthwise conv kernel size for Conformer encoder (paper best: 32)')
+    
+    ## PARSER FOR ATTRACTOR
     attractor_args = parser.add_argument_group('attractor')
     attractor_args.add_argument(
         '--time-shuffle', action='store_true',
@@ -457,7 +597,7 @@ def parse_arguments() -> SimpleNamespace: #def dummy():
         '--noam-scale-rule',
         default='sqrt',
         type=str,
-        choices=['linear', 'sqrt', 'step', 'hybrid'],  # <--- 'hybrid' 추가
+        choices=['linear', 'sqrt', 'step', 'hybrid'],  # <--- 'hybrid' is added
         help='LR scaling rule for Noam optimizer in DDP.'
     )
     parser.add_argument(
@@ -466,17 +606,24 @@ def parse_arguments() -> SimpleNamespace: #def dummy():
         help='If set, scales down warmup steps. For stability, not setting this is recommended.'
     )
     
+    # for sort loss
+    parser.add_argument('--use-posenc', action='store_true', help='Enable positional encoding (SortLoss will be used).')
+    parser.add_argument('--hybrid-loss', action='store_true',
+                        help='Enable hybrid loss: PIT + Sort (weights sum to 1).')
+    parser.add_argument('--hybrid-sort-weight', type=float, default=0.5,
+                        help='Weight for Sort loss (lambda in [0,1]). PIT gets (1-lambda).')
+    
     # --- Noam scalling options ---
     parser.add_argument('--noam-k', type=int, default=0,
-                        help='효과적 k(=world_size*accum_steps) 오버라이드. 0이면 자동.')
+                        help='Override effective k (= world_size × accum_steps). If 0, use automatic value.')
     parser.add_argument('--noam-alpha', type=float, default=None,
-                        help='lr_scale = k**alpha 로 강제. None이면 rule(linear/sqrt/hybrid/step)에 따름.')
+                        help='Force lr_scale = kalpha. If None, use the rule (linear/sqrt/hybrid/step).')
     parser.add_argument('--noam-lr-scale', type=float, default=None,
-                        help='lr_scale을 직접 지정(예: 2.0). 지정 시 rule/alpha 무시.')
+                        help='Set lr_scale manually (e.g., 2.0). If set, rule/alpha are ignored.')
     parser.add_argument('--noam-step-scale', type=int, default=0,
-                        help='step_scale(스케줄 진행 배수) 오버라이드. 0이면 rule에 따름.')
+                        help='Override step_scale (schedule multiplier). If 0, follow the rule.')
     parser.add_argument('--noam-warmup-scale', type=float, default=1.0,
-                        help='warmup_steps를 1/noam_warmup_scale 배로 줄임. (예: 2.0이면 warmup/2)')
+                        help='warmup_steps reduced by 1/noam_warmup_scale (e.g., 2.0 → warmup/2)')
     args = parser.parse_args()
     return args
 
@@ -491,8 +638,9 @@ if __name__ == '__main__': #def dummy():
     
     # For reproducibility
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)  # if you are using multi-GPU.
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)  # if you are using multi-GPU.
     np.random.seed(args.seed)  # Numpy module.
     random.seed(args.seed)  # Python random module.
     torch.backends.cudnn.enabled = False
@@ -540,6 +688,11 @@ if __name__ == '__main__': #def dummy():
 
     # move to device BEFORE wrapping
     model.to(args.device)
+
+    # tell which loss will be used (PIT or Sort) based on encoder.pos_enc
+    enc = model.module.enc if hasattr(model, "module") else model.enc
+    use_sort = hasattr(enc, "pos_enc") and (enc.pos_enc is not None)
+    logging.info("[MODEL] PosEnc=%s -> %s", str(use_sort), "SortLoss" if use_sort else "PIT")
     
     # --- DDP wrap (MUST AFTER LOADING CHECKPOINT) ---
     if args.ddp:
@@ -558,13 +711,15 @@ if __name__ == '__main__': #def dummy():
     if args.ddp and get_world_size() > 1 and args.optimizer in ("adam", "sgd"):
         args.lr = args.lr * get_world_size()  # simple linear scaling
     
-    if args.model_type == "TransformerEDA":
+    if args.model_type in ("TransformerEDA","ConformerEDA"):
         acum_train_metrics = new_metrics()
         acum_dev_metrics = new_metrics()
-    elif args.model_type == "TransformerSCDEDA":
+    elif args.model_type in ("TransformerSCDEDA", "ConformerSCDEDA"):
         acum_train_metrics = new_metrics_scd()
         acum_dev_metrics = new_metrics_scd()
-
+    else:
+        raise ValueError(f"Unknown model type: {args.model_type}")
+    
     # === CHECK THE CHECK POINT AND LOAD ===
     ckpt_dir = os.path.abspath(os.path.join(args.output_path, 'models'))
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -596,13 +751,20 @@ if __name__ == '__main__': #def dummy():
     if is_main_process():
         logging.info(f"#batches quantity for train: {train_batches_qty}")
         logging.info(f"#batches quantity for dev: {dev_batches_qty}")
+        
+        base_model = model.module if hasattr(model, "module") else model
+        logging.info(
+            f"[MODEL] use_posenc={base_model.use_posenc}, "
+            f"hybrid={base_model.hybrid_loss}, "
+            f"lambda={getattr(base_model, 'hybrid_sort_weight', None)}"
+        )
     
     # === TRAIN LOOP ===
     try:
         for epoch in range(init_epoch, args.max_epochs):
             model.train()
             
-            # ---- Gradient Accumulation 설정 (루프 바깥에서 한 번만 선언해도 OK) ----
+            # ---- Gradient accumulation setup (declare once outside the loop) ----
             accum_steps = max(1, int(getattr(args, "accum_steps", 1)))
                         
             # ---- per-epoch accumulators ----
@@ -677,7 +839,7 @@ if __name__ == '__main__': #def dummy():
                     else:
                         scaled_loss.backward()
 
-                    # ---- step/clip 타이밍: accum_steps 마다 또는 마지막 배치에서 ----
+                    # ---- step/clip timing: every accum_steps or at the last batch ----
                     do_step = (((i + 1) % accum_steps) == 0) or (done == train_batches_qty)
                     t3 = time.perf_counter()
                     opt_ms_local = None
@@ -698,7 +860,7 @@ if __name__ == '__main__': #def dummy():
                         else:
                             optimizer.step()
 
-                        # <<< 여기 추가: step이 실제로 일어난 타이밍에만 LR 로그 >>>
+                        # --- Log LR only at actual steps ---
                         if is_main_process() and writer is not None:
                             global_step = epoch * train_batches_qty + done
                             writer.add_scalar("lrate", get_rate(optimizer), global_step)  
@@ -725,6 +887,7 @@ if __name__ == '__main__': #def dummy():
                         pbar.set_postfix(
                             loss=f"{batch_log.get('loss', float('nan')):.4f}",
                             der=f"{batch_log.get('DER',  float('nan')):.4f}",
+                            core=batch_log.get('core', 'PIT'),
                             bt=f"{bt:.2f}s",
                             eta=f"{eta_sec}s",
                             step=f"{opt_ms_local:.1f}ms" if opt_ms_local is not None else "n/a",
@@ -787,7 +950,7 @@ if __name__ == '__main__': #def dummy():
                         args.vad_loss_weight, args.detach_attractor_loss)
                     t3 = time.perf_counter()
 
-                    # loss backward (누적 스케일)
+                    # loss backward (accumulated scale)
                     scaled_loss = loss / accum_steps
                     done = i + 1
                     is_last_batch = (done == train_batches_qty)
@@ -839,9 +1002,10 @@ if __name__ == '__main__': #def dummy():
                         pbar.set_postfix(
                             loss=f"{batch_log.get('loss', float('nan')):.4f}",
                             der=f"{batch_log.get('DER', float('nan')):.4f}",
+                            core=batch_log.get('core', 'PIT'),
                             bt=f"{bt:.2f}s",
                             eta=f"{eta_sec}s",
-                            step=f"{opt_ms:.1f}ms" if opt_ms is not None else "n/a",
+                            step=f"{opt_ms_local:.1f}ms" if opt_ms_local is not None else "n/a",
                             c=pct(dt_collate), f=pct(dt_fwd), b=pct(dt_bwd), s=pct(dt_step)
                         )
                         pbar.update(1)
@@ -892,7 +1056,7 @@ if __name__ == '__main__': #def dummy():
 
                 writer.add_scalar("train_loss_epoch", loss_train_epoch, epoch+1)
                 writer.add_scalar("train_DER_epoch",  der_train_epoch,  epoch+1)
-
+                
                 logging.info("=== [EPOCH %d] END | time=%.2fs | loss=%.4f | DER=%.4f ===",
                             epoch+1, epoch_time, loss_train_epoch, der_train_epoch)
                             
